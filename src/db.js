@@ -656,109 +656,118 @@ export function lookupBarcode(code) {
   return null;
 }
 
-// Asynchronous lookup connecting directly to Open Food Facts API & local catalog
+// Cache for ultra-fast instant lookups (0ms on repeat scans)
+const barcodeMemoryCache = new Map();
+
+// Ultra-fast Asynchronous lookup connecting directly to Open Food Facts API & local catalog
 export async function lookupBarcodeAsync(code) {
   if (!code) return null;
   const cleanCode = String(code).trim();
 
-  // Step 1: Check local catalog first (instant & offline)
-  const localMatch = lookupBarcode(cleanCode);
-  if (localMatch) return localMatch;
+  // Step 1: Memory cache check (0ms)
+  if (barcodeMemoryCache.has(cleanCode)) {
+    return barcodeMemoryCache.get(cleanCode);
+  }
 
-  // Prepare candidate codes (e.g. 12-digit UPC to 13-digit EAN with leading 0, and vice versa)
+  // Step 2: Check local catalog (0ms)
+  const localMatch = lookupBarcode(cleanCode);
+  if (localMatch) {
+    barcodeMemoryCache.set(cleanCode, localMatch);
+    return localMatch;
+  }
+
+  // Candidate barcodes (UPC-A 12 vs EAN-13 leading-0 variants)
   const candidateCodes = [cleanCode];
   if (cleanCode.length === 12) candidateCodes.push('0' + cleanCode);
   if (cleanCode.length === 13 && cleanCode.startsWith('0')) candidateCodes.push(cleanCode.substring(1));
 
-  // Step 2: Open Food Facts API
-  for (const c of candidateCodes) {
-    const offEndpoints = [
-      `https://world.openfoodfacts.org/api/v0/product/${encodeURIComponent(c)}.json`,
-      `https://world.openfoodfacts.org/api/v2/product/${encodeURIComponent(c)}?fields=product_name,product_name_en,generic_name,brands,categories_tags,nutriments,nutriscore_grade,image_front_small_url,image_front_url,quantity,packaging_tags`
-    ];
-
-    for (const url of offEndpoints) {
+  // Step 3: Fast Parallel Query to Open Food Facts v2 lightweight fields API (500 bytes instead of 2 MB)
+  const offPromises = candidateCodes.map(c => {
+    return new Promise(async (resolve) => {
       try {
         const controller = new AbortController();
-        const tid = setTimeout(() => controller.abort(), 5000);
+        const tid = setTimeout(() => controller.abort(), 1800); // 1.8s fast timeout
+        const url = `https://world.openfoodfacts.org/api/v2/product/${encodeURIComponent(c)}?fields=product_name,product_name_en,generic_name,brands,categories_tags,nutriscore_grade,image_front_small_url,quantity`;
         const res = await fetch(url, { signal: controller.signal });
         clearTimeout(tid);
-        if (!res.ok) continue;
+        if (!res.ok) return resolve(null);
         const data = await res.json();
-
-        const p = data.product || (data.status === 1 ? data.product : null);
-        if (!p) continue;
+        const p = data.product;
+        if (!p) return resolve(null);
 
         const name = (p.product_name || p.product_name_en || p.generic_name || '').trim();
-        if (!name) continue;
+        if (!name) return resolve(null);
 
-        // Determine category from tags
         const catTags = (p.categories_tags || []).join(' ').toLowerCase();
         let category = 'Produce';
         if (catTags.includes('dairy') || catTags.includes('milk') || catTags.includes('cheese') || catTags.includes('yogurt') || catTags.includes('butter')) {
           category = 'Dairy';
         } else if (catTags.includes('bakery') || catTags.includes('bread') || catTags.includes('cake') || catTags.includes('biscuit') || catTags.includes('pastry') || catTags.includes('cookie')) {
           category = 'Bakery';
-        } else if (catTags.includes('meat') || catTags.includes('seafood') || catTags.includes('poultry') || catTags.includes('fish') || catTags.includes('beef') || catTags.includes('chicken')) {
+        } else if (catTags.includes('meat') || catTags.includes('chicken') || catTags.includes('fish') || catTags.includes('beef') || catTags.includes('pork')) {
           category = 'Meat';
-        } else if (catTags.includes('beverage') || catTags.includes('drink') || catTags.includes('juice') || catTags.includes('water') || catTags.includes('soda') || catTags.includes('cola')) {
-          category = 'Produce';
-        } else if (catTags.includes('prepared') || catTags.includes('meal') || catTags.includes('ready-to-eat') || catTags.includes('frozen') || catTags.includes('soup')) {
+        } else if (catTags.includes('prepared') || catTags.includes('meal') || catTags.includes('soup') || catTags.includes('ready')) {
           category = 'Cooked Food';
-        } else if (catTags.includes('snack') || catTags.includes('chip') || catTags.includes('chocolate') || catTags.includes('candy') || catTags.includes('confection')) {
-          category = 'Bakery';
-        } else if (catTags.includes('cereal') || catTags.includes('grain') || catTags.includes('rice') || catTags.includes('pasta') || catTags.includes('flour') || catTags.includes('noodle')) {
-          category = 'Other';
-        } else if (catTags.includes('fruit') || catTags.includes('vegetable') || catTags.includes('salad')) {
-          category = 'Produce';
+        } else if (catTags.includes('cereal') || catTags.includes('grain') || catTags.includes('rice') || catTags.includes('pasta') || catTags.includes('noodle')) {
+          category = 'Grains';
         }
 
         const nutriScore = (p.nutriscore_grade || '').toUpperCase() || null;
         const brand = (p.brands || '').split(',')[0].trim();
 
-        return {
+        const product = {
           barcode: cleanCode,
           name: brand ? `${brand} ${name}` : name,
           brand: brand || null,
-          category: category,
-          unit: p.quantity ? 'units' : 'units',
+          category,
+          unit: 'units',
           packageSize: p.quantity || null,
           defaultQty: 1,
           source: 'Open Food Facts 🌐',
-          nutriScore: nutriScore || null,
-          imageUrl: p.image_front_small_url || p.image_front_url || null
+          nutriScore,
+          imageUrl: p.image_front_small_url || null
         };
-      } catch (err) {
-        // Silently continue to fallback
+        resolve(product);
+      } catch (_) {
+        resolve(null);
+      }
+    });
+  });
+
+  try {
+    const results = await Promise.all(offPromises);
+    const found = results.find(r => r !== null);
+    if (found) {
+      barcodeMemoryCache.set(cleanCode, found);
+      return found;
+    }
+  } catch (_) {}
+
+  // Step 4: Fast Fallback to UPCitemDB (max 1.5s)
+  try {
+    const controller = new AbortController();
+    const tid = setTimeout(() => controller.abort(), 1500);
+    const res = await fetch(`https://api.upcitemdb.com/prod/trial/lookup?upc=${encodeURIComponent(cleanCode)}`, { signal: controller.signal });
+    clearTimeout(tid);
+    if (res.ok) {
+      const data = await res.json();
+      if (data.code === 'OK' && data.items && data.items.length > 0) {
+        const item = data.items[0];
+        const product = {
+          barcode: cleanCode,
+          name: item.title || item.description || `Product (${cleanCode})`,
+          brand: item.brand || null,
+          category: 'Other',
+          unit: 'units',
+          defaultQty: 1,
+          source: 'UPCitemDB 🌐',
+          imageUrl: item.images && item.images.length > 0 ? item.images[0] : null
+        };
+        barcodeMemoryCache.set(cleanCode, product);
+        return product;
       }
     }
-  }
-
-  // Step 3: UPCitemDB Fallback
-  for (const c of candidateCodes) {
-    try {
-      const controller = new AbortController();
-      const tid = setTimeout(() => controller.abort(), 4000);
-      const res = await fetch(`https://api.upcitemdb.com/prod/trial/lookup?upc=${encodeURIComponent(c)}`, { signal: controller.signal });
-      clearTimeout(tid);
-      if (res.ok) {
-        const data = await res.json();
-        if (data.code === 'OK' && data.items && data.items.length > 0) {
-          const item = data.items[0];
-          return {
-            barcode: cleanCode,
-            name: item.title || item.description || `Product (${cleanCode})`,
-            brand: item.brand || null,
-            category: 'Other',
-            unit: 'units',
-            defaultQty: 1,
-            source: 'UPCitemDB 🌐',
-            imageUrl: item.images && item.images.length > 0 ? item.images[0] : null
-          };
-        }
-      }
-    } catch (_) {}
-  }
+  } catch (_) {}
 
   return null;
 }

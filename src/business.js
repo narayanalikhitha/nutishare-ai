@@ -555,16 +555,27 @@ async function decodeBarcodeFromImageFile(file) {
           } catch (_) {}
         }
 
-        // 2. Try ZXing BrowserMultiFormatReader on canvas
+        // 2. Try ZXing BrowserMultiFormatReader on canvas with TRY_HARDER enabled for photos
         if (!decoded) {
           try {
-            if (!zxingReader && window.ZXing && window.ZXing.BrowserMultiFormatReader) {
-              zxingReader = new window.ZXing.BrowserMultiFormatReader();
+            const imgHints = new Map();
+            if (window.ZXing && window.ZXing.DecodeHintType) {
+              imgHints.set(window.ZXing.DecodeHintType.TRY_HARDER, true);
+              if (window.ZXing.BarcodeFormat) {
+                imgHints.set(window.ZXing.DecodeHintType.POSSIBLE_FORMATS, [
+                  window.ZXing.BarcodeFormat.EAN_13,
+                  window.ZXing.BarcodeFormat.EAN_8,
+                  window.ZXing.BarcodeFormat.UPC_A,
+                  window.ZXing.BarcodeFormat.UPC_E,
+                  window.ZXing.BarcodeFormat.CODE_128,
+                  window.ZXing.BarcodeFormat.CODE_39,
+                  window.ZXing.BarcodeFormat.QR_CODE
+                ]);
+              }
             }
-            if (zxingReader) {
-              const res = await zxingReader.decodeFromImageElement(canvas);
-              if (res) decoded = res.getText();
-            }
+            const imgReader = new window.ZXing.BrowserMultiFormatReader(imgHints);
+            const res = await imgReader.decodeFromImageElement(canvas);
+            if (res) decoded = res.getText();
           } catch (_) {}
         }
 
@@ -623,20 +634,33 @@ async function startScanner() {
   try {
     stopScanner(); // Clean up previous session
 
-    // Acquire stream safely
+    // Acquire stream safely with continuous autofocus support
     let stream;
     const selectedId = cameraSelect && cameraSelect.value && cameraSelect.value.trim();
     try {
+      const videoConstraints = {
+        facingMode: { ideal: 'environment' },
+        width: { ideal: 1280 },
+        height: { ideal: 720 }
+      };
       if (selectedId) {
-        stream = await navigator.mediaDevices.getUserMedia({ video: { deviceId: { exact: selectedId } } });
-      } else {
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }
-        });
+        videoConstraints.deviceId = { exact: selectedId };
       }
+      stream = await navigator.mediaDevices.getUserMedia({ video: videoConstraints });
     } catch (_) {
       stream = await navigator.mediaDevices.getUserMedia({ video: true });
     }
+
+    // Attempt continuous autofocus if supported by camera hardware
+    try {
+      const track = stream.getVideoTracks()[0];
+      if (track && track.getCapabilities) {
+        const caps = track.getCapabilities();
+        if (caps.focusMode && caps.focusMode.includes('continuous')) {
+          await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
+        }
+      }
+    } catch (_) {}
 
     if (!video) throw new Error('Video element not found');
     video.srcObject = stream;
@@ -656,7 +680,7 @@ async function startScanner() {
       }
     } catch (_) {}
 
-    // Init ZXing Reader instance with broad barcode hints
+    // Init ZXing Reader instance: optimize for lightning-fast live video feed (60ms interval, no TRY_HARDER on stream)
     if (!zxingReader && window.ZXing && window.ZXing.BrowserMultiFormatReader) {
       try {
         const hints = new Map();
@@ -670,11 +694,11 @@ async function startScanner() {
             window.ZXing.BarcodeFormat.CODE_39,
             window.ZXing.BarcodeFormat.QR_CODE
           ]);
-          hints.set(window.ZXing.DecodeHintType.TRY_HARDER, true);
         }
-        zxingReader = new window.ZXing.BrowserMultiFormatReader(hints, 250);
+        // 60ms interval checks ~16 times per second without CPU bottleneck
+        zxingReader = new window.ZXing.BrowserMultiFormatReader(hints, 60);
       } catch (_) {
-        zxingReader = new window.ZXing.BrowserMultiFormatReader();
+        zxingReader = new window.ZXing.BrowserMultiFormatReader(null, 60);
       }
     }
 
