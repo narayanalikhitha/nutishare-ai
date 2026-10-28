@@ -247,21 +247,23 @@ export function getInventory(businessId) {
 
 export function addInventoryItem(businessId, item) {
   const db = getDB();
+  const effectiveBizId = businessId || (db.users && db.users.find(u => u.role === 'business') ? db.users.find(u => u.role === 'business').id : 'usr_business_1');
   const newItem = {
     id: `inv_${Date.now()}`,
-    businessId,
+    businessId: effectiveBizId,
     name: item.name,
-    category: item.category,
-    quantity: parseFloat(item.quantity),
+    category: item.category || 'Other',
+    quantity: parseFloat(item.quantity) || 1,
     unit: item.unit || 'units',
     purchaseDate: item.purchaseDate || new Date().toISOString().split('T')[0],
-    expiryDate: item.expiryDate,
+    expiryDate: item.expiryDate || new Date(Date.now() + 5*24*60*60*1000).toISOString().split('T')[0],
+    barcode: item.barcode || null,
     status: 'active'
   };
 
-  db.inventory.push(newItem);
+  db.inventory.unshift(newItem);
   
-  // Update sales velocity library mock if not present
+  if (!db.salesVelocity) db.salesVelocity = {};
   if (!db.salesVelocity[item.name]) {
     db.salesVelocity[item.name] = Math.floor(Math.random() * 8) + 2; // Random speed 2-10
   }
@@ -654,79 +656,108 @@ export function lookupBarcode(code) {
   return null;
 }
 
-// Asynchronous lookup connecting directly to Open Food Facts API
+// Asynchronous lookup connecting directly to Open Food Facts API & local catalog
 export async function lookupBarcodeAsync(code) {
-  // Step 1: Check local catalog first (offline-capable)
-  const localMatch = lookupBarcode(code);
+  if (!code) return null;
+  const cleanCode = String(code).trim();
+
+  // Step 1: Check local catalog first (instant & offline)
+  const localMatch = lookupBarcode(cleanCode);
   if (localMatch) return localMatch;
 
-  const cleanCode = code.trim();
+  // Prepare candidate codes (e.g. 12-digit UPC to 13-digit EAN with leading 0, and vice versa)
+  const candidateCodes = [cleanCode];
+  if (cleanCode.length === 12) candidateCodes.push('0' + cleanCode);
+  if (cleanCode.length === 13 && cleanCode.startsWith('0')) candidateCodes.push(cleanCode.substring(1));
 
-  // Step 2: Open Food Facts API — use v0 endpoint which supports CORS from browsers
-  // Also try the world subdomain which is the main production CORS-enabled endpoint
-  const offEndpoints = [
-    `https://world.openfoodfacts.org/api/v0/product/${encodeURIComponent(cleanCode)}.json`,
-    `https://world.openfoodfacts.net/api/v2/product/${encodeURIComponent(cleanCode)}?fields=product_name,product_name_en,generic_name,brands,categories_tags,nutriments,nutriscore_grade,image_front_small_url,image_front_url,quantity,packaging_tags`
-  ];
+  // Step 2: Open Food Facts API
+  for (const c of candidateCodes) {
+    const offEndpoints = [
+      `https://world.openfoodfacts.org/api/v0/product/${encodeURIComponent(c)}.json`,
+      `https://world.openfoodfacts.org/api/v2/product/${encodeURIComponent(c)}?fields=product_name,product_name_en,generic_name,brands,categories_tags,nutriments,nutriscore_grade,image_front_small_url,image_front_url,quantity,packaging_tags`
+    ];
 
-  for (const url of offEndpoints) {
+    for (const url of offEndpoints) {
+      try {
+        const controller = new AbortController();
+        const tid = setTimeout(() => controller.abort(), 5000);
+        const res = await fetch(url, { signal: controller.signal });
+        clearTimeout(tid);
+        if (!res.ok) continue;
+        const data = await res.json();
+
+        const p = data.product || (data.status === 1 ? data.product : null);
+        if (!p) continue;
+
+        const name = (p.product_name || p.product_name_en || p.generic_name || '').trim();
+        if (!name) continue;
+
+        // Determine category from tags
+        const catTags = (p.categories_tags || []).join(' ').toLowerCase();
+        let category = 'Produce';
+        if (catTags.includes('dairy') || catTags.includes('milk') || catTags.includes('cheese') || catTags.includes('yogurt') || catTags.includes('butter')) {
+          category = 'Dairy';
+        } else if (catTags.includes('bakery') || catTags.includes('bread') || catTags.includes('cake') || catTags.includes('biscuit') || catTags.includes('pastry') || catTags.includes('cookie')) {
+          category = 'Bakery';
+        } else if (catTags.includes('meat') || catTags.includes('seafood') || catTags.includes('poultry') || catTags.includes('fish') || catTags.includes('beef') || catTags.includes('chicken')) {
+          category = 'Meat';
+        } else if (catTags.includes('beverage') || catTags.includes('drink') || catTags.includes('juice') || catTags.includes('water') || catTags.includes('soda') || catTags.includes('cola')) {
+          category = 'Produce';
+        } else if (catTags.includes('prepared') || catTags.includes('meal') || catTags.includes('ready-to-eat') || catTags.includes('frozen') || catTags.includes('soup')) {
+          category = 'Cooked Food';
+        } else if (catTags.includes('snack') || catTags.includes('chip') || catTags.includes('chocolate') || catTags.includes('candy') || catTags.includes('confection')) {
+          category = 'Bakery';
+        } else if (catTags.includes('cereal') || catTags.includes('grain') || catTags.includes('rice') || catTags.includes('pasta') || catTags.includes('flour') || catTags.includes('noodle')) {
+          category = 'Other';
+        } else if (catTags.includes('fruit') || catTags.includes('vegetable') || catTags.includes('salad')) {
+          category = 'Produce';
+        }
+
+        const nutriScore = (p.nutriscore_grade || '').toUpperCase() || null;
+        const brand = (p.brands || '').split(',')[0].trim();
+
+        return {
+          barcode: cleanCode,
+          name: brand ? `${brand} ${name}` : name,
+          brand: brand || null,
+          category: category,
+          unit: p.quantity ? 'units' : 'units',
+          packageSize: p.quantity || null,
+          defaultQty: 1,
+          source: 'Open Food Facts 🌐',
+          nutriScore: nutriScore || null,
+          imageUrl: p.image_front_small_url || p.image_front_url || null
+        };
+      } catch (err) {
+        // Silently continue to fallback
+      }
+    }
+  }
+
+  // Step 3: UPCitemDB Fallback
+  for (const c of candidateCodes) {
     try {
       const controller = new AbortController();
-      const tid = setTimeout(() => controller.abort(), 6000);
-      const res = await fetch(url, {
-        signal: controller.signal,
-        headers: { 'User-Agent': 'NutriShare-AI/1.0 (food-redistribution-platform)' }
-      });
+      const tid = setTimeout(() => controller.abort(), 4000);
+      const res = await fetch(`https://api.upcitemdb.com/prod/trial/lookup?upc=${encodeURIComponent(c)}`, { signal: controller.signal });
       clearTimeout(tid);
-      if (!res.ok) continue;
-      const data = await res.json();
-
-      // v0 uses status=1, v2 uses product object directly
-      const p = data.product || (data.status === 1 ? data.product : null);
-      if (!p) continue;
-
-      const name = (p.product_name || p.product_name_en || p.generic_name || '').trim();
-      if (!name) continue; // skip if no name returned
-
-      // Determine category from tags
-      const catTags = (p.categories_tags || []).join(' ').toLowerCase();
-      let category = 'Produce';
-      if (catTags.includes('dairy') || catTags.includes('milk') || catTags.includes('cheese') || catTags.includes('yogurt') || catTags.includes('butter')) {
-        category = 'Dairy';
-      } else if (catTags.includes('bakery') || catTags.includes('bread') || catTags.includes('cake') || catTags.includes('biscuit') || catTags.includes('pastry')) {
-        category = 'Bakery';
-      } else if (catTags.includes('meat') || catTags.includes('seafood') || catTags.includes('poultry') || catTags.includes('fish') || catTags.includes('beef') || catTags.includes('chicken')) {
-        category = 'Meat';
-      } else if (catTags.includes('beverage') || catTags.includes('drink') || catTags.includes('juice') || catTags.includes('water') || catTags.includes('soda')) {
-        category = 'Beverages';
-      } else if (catTags.includes('prepared') || catTags.includes('meal') || catTags.includes('ready-to-eat') || catTags.includes('frozen')) {
-        category = 'Cooked Food';
-      } else if (catTags.includes('snack') || catTags.includes('chip') || catTags.includes('chocolate') || catTags.includes('candy') || catTags.includes('confection')) {
-        category = 'Snacks';
-      } else if (catTags.includes('cereal') || catTags.includes('grain') || catTags.includes('rice') || catTags.includes('pasta') || catTags.includes('flour')) {
-        category = 'Grains';
-      } else if (catTags.includes('fruit') || catTags.includes('vegetable') || catTags.includes('salad')) {
-        category = 'Produce';
+      if (res.ok) {
+        const data = await res.json();
+        if (data.code === 'OK' && data.items && data.items.length > 0) {
+          const item = data.items[0];
+          return {
+            barcode: cleanCode,
+            name: item.title || item.description || `Product (${cleanCode})`,
+            brand: item.brand || null,
+            category: 'Other',
+            unit: 'units',
+            defaultQty: 1,
+            source: 'UPCitemDB 🌐',
+            imageUrl: item.images && item.images.length > 0 ? item.images[0] : null
+          };
+        }
       }
-
-      const nutriScore = (p.nutriscore_grade || '').toUpperCase() || null;
-      const brand = (p.brands || '').split(',')[0].trim();
-
-      return {
-        barcode: cleanCode,
-        name: name,
-        brand: brand || null,
-        category: category,
-        unit: p.quantity ? 'units' : 'units',
-        packageSize: p.quantity || null,
-        defaultQty: 1,
-        source: 'Open Food Facts 🌐',
-        nutriScore: nutriScore || null,
-        imageUrl: p.image_front_small_url || p.image_front_url || null
-      };
-    } catch (err) {
-      console.warn(`OFF endpoint failed (${url.includes('net') ? 'v2' : 'v0'}):`, err.name === 'AbortError' ? 'Timeout' : err.message);
-    }
+    } catch (_) {}
   }
 
   return null;

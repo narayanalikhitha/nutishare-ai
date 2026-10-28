@@ -184,17 +184,32 @@ function initNgoScanner() {
         startBtn.classList.add('d-none');
         
         const deviceId = cameraSelect && cameraSelect.value ? cameraSelect.value : null;
-        if (codeReader) {
-          await codeReader.decodeFromVideoDevice(deviceId, videoEl, (result, err) => {
+        let stream;
+        try {
+          if (deviceId) {
+            stream = await navigator.mediaDevices.getUserMedia({ video: { deviceId: { exact: deviceId } } });
+          } else {
+            stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } } });
+          }
+        } catch (_) {
+          stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        }
+
+        videoEl.srcObject = stream;
+        videoEl.setAttribute('playsinline', 'true');
+        videoEl.muted = true;
+        await videoEl.play();
+
+        if (codeReader && typeof codeReader.decodeFromVideoElementContinuously === 'function') {
+          codeReader.decodeFromVideoElementContinuously(videoEl, (result, err) => {
             if (result) {
-              codeReader.reset();
+              try { codeReader.reset(); } catch (_) {}
+              if (stream) stream.getTracks().forEach(t => t.stop());
               if (stopBtn) stopBtn.classList.add('d-none');
               if (startBtn) startBtn.classList.remove('d-none');
               handleNgoScanResult(result.getText());
             }
           });
-        } else {
-          throw new Error('ZXing scanner not loaded');
         }
       } catch (e) {
         console.error('Failed to start camera scanner:', e);
